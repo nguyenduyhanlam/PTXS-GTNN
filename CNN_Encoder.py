@@ -14,8 +14,7 @@ import re
 import random
 import numpy as np
 import html
-from queue import PriorityQueue
-import operator
+from torch.autograd import Variable
 
 import torch
 import torch.nn as nn
@@ -271,6 +270,168 @@ print(random.choice(pairs))
 print(lemmatizer("I'm excited about watching that movie"))
 print(lemmatizer("The pizza was delivered to the wrong address"))
 
+class GRC(nn.Module):
+    def __init__(self, char_enc_size, label_to_ind, rnn_type, emb_size, hidden_size, num_layers,
+                  bidirectional,max_path, recurrent_drop=0, input_drop=0):
+        super(GRC, self).__init__()
+        self.char_embed = nn.Linear(char_enc_size, emb_size)
+        self.rnn_type = rnn_type
+        self.hidden_size = hidden_size 
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.hidden_size_seg = self.hidden_size
+        self.recurrent_drop = recurrent_drop
+        
+        if self.bidirectional == True:
+            self.NUM_DIRECTIONS = 2
+        else:
+            self.NUM_DIRECTIONS = 1
+        if rnn_type in ['LSTM', 'GRU']:
+            self.rnn = getattr(nn, rnn_type)(emb_size, self.hidden_size // self.NUM_DIRECTIONS, num_layers, batch_first=False,
+                              dropout=self.recurrent_drop, bidirectional = self.bidirectional)
+         
+        self.WL = nn.Linear(self.hidden_size, self.hidden_size, bias=None)
+        self.WR = nn.Linear(self.hidden_size, self.hidden_size, bias=None)
+        
+        self.bw = nn.Parameter(torch.FloatTensor(1, self.hidden_size).zero_())        
+        
+        self.GL = nn.Linear(self.hidden_size, 3*self.hidden_size, bias=None)
+        self.GR = nn.Linear(self.hidden_size, 3*self.hidden_size, bias=None)
+        
+        self.bg = nn.Parameter(torch.FloatTensor(1, 3*self.hidden_size).zero_())     
+        self.sigm = torch.nn.Sigmoid()    
+        
+        self.tag_to_ix = label_to_ind
+        self.tagset_size = len(self.tag_to_ix)
+        self.max_path = max_path
+        
+        self.drop3d = nn.Dropout3d(input_drop)
+        self.drop = nn.Dropout(input_drop)
+        
+        self.fc = nn.Linear(self.hidden_size_seg,  self.tagset_size)
+        self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
+    
+        self.init_weights()
+
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        if self.rnn_type == 'LSTM':
+            return (Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_()),
+                        Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_()))
+        else:
+            return Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_() )    
+    
+    
+    def init_hidden_seg(self, batch_size):
+        weight = next(self.parameters()).data
+        if self.rnn_type == 'LSTM':
+            return (Variable(weight.new(1, batch_size, self.hidden_size_seg //2  ).zero_()),
+                        Variable(weight.new(1, batch_size, self.hidden_size_seg //2).zero_()))
+        else:
+            return Variable(weight.new(1, batch_size, self.hidden_size_seg).zero_() ) 
+
+
+    def forward(self, x_batch_s, hidden, sorted_vals):
+        batch_size = x_batch_s.size(1)
+        x_batch_s = self.drop3d(x_batch_s)
+        emb = self.char_embed(x_batch_s)
+        emb = self.drop(emb)
+        
+        pack_emb = torch.nn.utils.rnn.pack_padded_sequence(emb, sorted_vals)
+        out, hidden = self.rnn(pack_emb, hidden)
+        unpacked, unpacked_len = torch.nn.utils.rnn.pad_packed_sequence(out)
+        
+        max_len = unpacked.size(0)
+        unpacked = unpacked.transpose(1,0)
+
+        segment_feat = Variable(unpacked.data.new(batch_size, max_len, self.max_path, self.hidden_size).fill_(0))
+        segment_feat[:, :, 0, :] = unpacked[:,:,:]
+        
+        left_feat = unpacked[:,:-1,:].contiguous().view(-1, self.hidden_size )
+        right_feat = unpacked[:,1:,:].contiguous().view(-1, self.hidden_size )
+        
+        for i in range(1, self.max_path):
+            next_level_cand = self.WL(left_feat) + self.WR(right_feat) + self.bw
+            next_level_cand = 4*(self.sigm(next_level_cand) - 0.5)
+            
+            gate_feat = self.GL(left_feat) + self.GR(right_feat) + self.bg
+            gate_feat = torch.exp(gate_feat)
+            
+            theta_scores =  tuple( gate_feat[:, i*self.hidden_size:(i+1)*self.hidden_size].unsqueeze(-1) for i in range(3) )
+            theta_scores = torch.cat( theta_scores, 2)
+            
+            Z = torch.sum(theta_scores, 2)
+            inv_z = 1/Z.unsqueeze(-1).expand(*Z.size(), 3)
+            theta_norm = theta_scores * inv_z
+            
+            next_level_cand =   torch.mul(left_feat,theta_norm[:,:,0]) + torch.mul(right_feat,theta_norm[:,:,1]) + torch.mul(next_level_cand,theta_norm[:,:,2])
+            next_level_cand = next_level_cand.view(batch_size, max_len-i, self.hidden_size)
+            
+            segment_feat[:, i:, i, :] = next_level_cand
+            left_feat = next_level_cand[:,:-1,:].contiguous().view(-1, self.hidden_size )
+            right_feat = next_level_cand[:,1:,:].contiguous().view(-1, self.hidden_size )
+
+        #Get tag scores for crf
+        segment_feat = self.fc(self.drop(segment_feat.view(-1, self.hidden_size) ))
+        segment_feat = segment_feat.view(batch_size, max_len, self.max_path, self.tagset_size)
+        
+        return segment_feat, hidden    
+  
+    
+    def init_weights(self):
+        self.fc.bias.data.fill_(0)
+        for name, param in self.named_parameters(): 
+            if ('weight' in name): 
+                print ('Initializing ', name) 
+                initrange = np.sqrt( 6 / sum(param.size()))
+                self.state_dict()[name].uniform_(-initrange, initrange)
+             
+        
+    def _forward_alg(self, logits, len_list, is_volatile=False):
+        """
+        Computes the (batch_size,) denominator term (FloatTensor list) for the log-likelihood, which is the
+        sum of the likelihoods across all possible state sequences.
+        
+        Arguments:
+            logits: [batch_size, seq_len, max_path, n_labels] FloatTensor
+            lens: [batch_size] LongTensor
+        """
+        batch_size, seq_len, max_path, n_labels = logits.size()
+        
+        alpha = logits.data.new(batch_size, seq_len+1, self.tagset_size).fill_(-10000)
+        alpha[:, 0, self.tag_to_ix['START']] = 0
+        alpha = Variable(alpha, volatile=is_volatile)
+        
+        # Transpose batch size and time dimensions:
+        logits_t = logits.permute(1,0,2,3)
+        c_lens = len_list.clone()
+        
+        alpha_out_sum = Variable(logits.data.new(batch_size,max_path, self.tagset_size).fill_(0))
+        mat = Variable(logits.data.new(batch_size,self.tagset_size,self.tagset_size).fill_(0))
+        
+        for j, logit in enumerate(logits_t):
+            for i in range(0,max_path):
+                if i<=j:
+                    alpha_exp = alpha[:,j-i, :].clone().unsqueeze(1).expand(batch_size,self.tagset_size, self.tagset_size)
+                    logit_exp = logit[:, i].unsqueeze(-1).expand(batch_size, self.tagset_size, self.tagset_size)
+                    trans_exp = self.transitions.unsqueeze(0).expand_as(alpha_exp)
+                    mat = alpha_exp + logit_exp + trans_exp
+                    alpha_out_sum[:,i,:] =  log_sum_exp(mat , 2, keepdim=True)
+                    
+            alpha_nxt = log_sum_exp(alpha_out_sum , dim=1, keepdim=True).squeeze(1)
+            
+            mask = Variable((c_lens > 0).float().unsqueeze(-1).expand(batch_size,self.tagset_size))
+            alpha_nxt = mask * alpha_nxt + (1 - mask) *alpha[:, j, :].clone() 
+            
+            c_lens = c_lens - 1      
+
+            alpha[:,j+1, :] = alpha_nxt
+
+        alpha[:,-1,:] = alpha[:,-1,:] + self.transitions[self.tag_to_ix['STOP']].unsqueeze(0).expand_as(alpha[:,-1,:])
+        norm = log_sum_exp(alpha[:,-1,:], 1).squeeze(-1)
+
+        return norm
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(EncoderRNN, self).__init__()
@@ -353,336 +514,6 @@ class DecoderRNN(nn.Module):
     def initHidden(self):
         # Initiate the first hidden unit
         return torch.zeros(1, 1, self.hidden_size, device=device)
-
-class BeamSearchNode(object):
-    def __init__(self, hiddenstate, previousNode, resultId, wordId, logProb, loss_value, length, decoder_attentions):
-        '''
-        :param hiddenstate:
-        :param previousNode:
-        :param wordId:
-        :param logProb:
-        :param length:
-        '''
-        self.h = hiddenstate
-        self.prevNode = previousNode
-        self.wordid = wordId
-        self.logp = logProb
-        self.leng = length
-        self.id = resultId
-        self.loss = loss_value
-        self.da = decoder_attentions
-
-    def eval(self, alpha=1.0):
-        reward = 0
-        # Add here a function for shaping a reward
-
-        return self.logp / float(self.leng - 1 + 1e-6) + alpha * reward
-
-def check_exist(in_list, check_id):
-    for (score, node) in in_list:
-        if(node.id == check_id):
-            return True
-    return False
-    
-def beam_search(beam_width, decoder, encoder_hidden, encoder_outputs=None, max_length=MAX_LENGTH):
-    '''
-    :param beam_width: beam width
-    :param decoder: decoder object (class)
-    :param encoder_hidden: encoder hidden after encoding process
-    :param encoder_outputs: encoder outputs
-    :param max_length: MAX_LENGTH limit
-    '''
-    # Initiate decoder input
-    decoder_input = torch.tensor([[SOS_token]], device=device)
-
-    # Assign encoder result to the 1st decoder hidden unit
-    decoder_hidden = encoder_hidden
-    
-    # Initiate searching process
-    queue = PriorityQueue()
-    
-    # starting node -  hidden vector, previous node, result id, word id, logp, loss_value, length, decoder_attentions
-    node = BeamSearchNode(decoder_hidden, None, SOS_token, decoder_input, 0, 0, 1, None)
-    
-    # Put to the queue and increase its size
-    queue.put((-node.eval(), node))
-    qsize = 1
-    
-    # Initiate some variables
-    next_node = []
-        
-    # Save output size
-    target_length = max_length
-    
-    for di in range(target_length):
-        # Get elements the beam
-        while queue.empty() == False:
-            # fetch the node from queue
-            score, n = queue.get()
-            qsize -= 1
-            decoder_input = n.wordid
-            decoder_hidden = n.h
-            curr_id = n.id
-            
-            if(check_exist(next_node, curr_id) == False):
-                # Execute decoding process
-                decoder_output, decoder_hidden, decoder_attention = decoder(
-                    decoder_input, decoder_hidden, encoder_outputs)
-            
-                # Get (beam_width) top results
-                topv, topi = decoder_output.topk(beam_width)
-            
-                # Create the nodes and save the results to next_nodes array
-                for i in range(beam_width):
-                    decoder_input = topi[0][i].squeeze().detach()
-                    prob = n.logp + topv[0][i]
-                    node_length = n.leng + 1
-                    
-                    # queue node -  hidden vector, previous node, result id, word id, logp, loss_value, length, decoder_attentions
-                    node = BeamSearchNode(decoder_hidden, n, topi[0][i], decoder_input, prob, 0, node_length, decoder_attention.data)
-                    
-                    # Calculate the score for each node
-                    score = -node.eval()
-                
-                    # Save the result
-                    next_node.append((score, node))
-            
-        # Get top values (beam_width)
-        top_values = sorted(next_node, key = lambda x: x[0], reverse = True)[:beam_width]
-        # Put to the queue
-        for v in top_values:
-            queue.put(v)
-            qsize += 1
-        
-        # Clear the array for the next step
-        next_node = []
-    
-    utterances = []    
-    while queue.empty() == False:
-        # fetch the node from queue
-        score, n = queue.get()
-        qsize -= 1
-            
-        utterance = []
-        utterance.append((n.da, n.wordid))
-        # back trace
-        while n.prevNode != None:
-            n = n.prevNode
-            utterance.append((n.da, n.wordid))
-
-        utterance = utterance[::-1]
-        utterances.append(utterance)
-            
-    return utterances
-
-def beam_decode(target_tensor, decoder, decoder_hiddens, encoder_outputs=None):
-    '''
-    :param target_tensor: target indexes tensor of shape [B, T] where B is the batch size and T is the maximum length of the output sentence
-    :param decoder_hidden: input tensor of shape [1, B, H] for start of the decoding
-    :param encoder_outputs: if you are using attention mechanism you can pass encoder outputs, [T, B, H] where T is the maximum length of input sentence
-    :return: decoded_batch
-    '''
-
-    beam_width = 10
-    topk = 1  # how many sentence do you want to generate
-    decoded_batch = []
-
-    # decoding goes sentence by sentence
-    for idx in range(target_tensor.size(0)):
-        decoder_hidden = decoder_hiddens[:, :, idx].unsqueeze(0)    
-
-        # Start with the start of the sentence token
-        decoder_input = torch.tensor([[SOS_token]], device=device)
-
-        # Number of sentence to generate
-        endnodes = []
-        number_required = min((topk + 1), topk - len(endnodes))
-
-        # starting node -  hidden vector, previous node, word id, logp, length
-        node = BeamSearchNode(decoder_hidden, None, decoder_input, 0, 1)
-        nodes = PriorityQueue()
-
-        # start the queue
-        nodes.put((-node.eval(), node))
-        qsize = 1
-
-        # start beam search
-        while True:
-            # give up when decoding takes too long
-            if qsize > 2000: break
-
-            # fetch the best node
-            score, n = nodes.get()
-            decoder_input = n.wordid
-            decoder_hidden = n.h
-
-            if n.wordid.item() == EOS_token and n.prevNode != None:
-                endnodes.append((score, n))
-                # if we reached maximum # of sentences required
-                if len(endnodes) >= number_required:
-                    break
-                else:
-                    continue
-
-            # decode for one step using decoder
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
-
-            # PUT HERE REAL BEAM SEARCH OF TOP
-            log_prob, indexes = torch.topk(decoder_output, beam_width)
-            nextnodes = []
-
-            for new_k in range(beam_width):
-                decoded_t = indexes[0][new_k].view(1, -1)
-                log_p = log_prob[0][new_k].item()
-
-                node = BeamSearchNode(decoder_hidden, n, decoded_t, n.logp + log_p, n.leng + 1)
-                score = -node.eval()
-                nextnodes.append((score, node))
-
-            # put them into queue
-            for i in range(len(nextnodes)):
-                score, nn = nextnodes[i]
-                nodes.put((score, nn))
-            # increase qsize
-            qsize += len(nextnodes) - 1
-
-        # choose nbest paths, back trace them
-        if len(endnodes) == 0:
-            endnodes = [nodes.get() for _ in range(topk)]
-
-        utterances = []
-        # Sort the endnodes by its probabilities
-        for score, n in sorted(endnodes, key=operator.itemgetter(0)):
-            utterance = []
-            utterance.append(n.wordid)
-            # back trace
-            while n.prevNode != None:
-                n = n.prevNode
-                utterance.append(n.wordid)
-
-            utterance = utterance[::-1]
-            utterances.append(utterance)
-
-        decoded_batch.append(utterances)
-
-    return decoded_batch
-
-def beam_decode_evaluate(decoder, decoder_hiddens, encoder_outputs=None):
-    '''
-    :param target_tensor: target indexes tensor of shape [B, T] where B is the batch size and T is the maximum length of the output sentence
-    :param decoder_hidden: input tensor of shape [1, B, H] for start of the decoding
-    :param encoder_outputs: if you are using attention mechanism you can pass encoder outputs, [T, B, H] where T is the maximum length of input sentence
-    :return: decoded_batch
-    '''
-
-    beam_width = 10
-    topk = 1  # how many sentence do you want to generate
-    decoded_batch = []
-
-    # decoding goes sentence by sentence
-    idx = 0
-    if isinstance(decoder_hiddens, tuple):  # LSTM case
-        decoder_hidden = (decoder_hiddens[0][:,idx, :].unsqueeze(0),decoder_hiddens[1][:,idx, :].unsqueeze(0))
-    else:
-        decoder_hidden = decoder_hiddens[:, idx, :].unsqueeze(0)
-    # Start with the start of the sentence token
-    decoder_input = torch.tensor([[SOS_token]], device=device)
-
-    # Number of sentence to generate
-    endnodes = []
-    number_required = min((topk + 1), topk - len(endnodes))
-    
-     # starting node -  hidden vector, previous node, word id, logp, length
-    node = BeamSearchNode(decoder_hidden, None, decoder_input, 0, 1)
-    nodes = PriorityQueue()
-
-    # start the queue
-    nodes.put((-node.eval(), node))
-    qsize = 1
-    
-    # start beam search
-    while True:
-        # give up when decoding takes too long
-        if qsize > 2000: break
-
-        # fetch the best node
-        score, n = nodes.get()
-        decoder_input = n.wordid
-        decoder_hidden = n.h
-
-        if n.wordid.item() == EOS_token and n.prevNode != None:
-            endnodes.append((score, n))
-            # if we reached maximum # of sentences required
-            if len(endnodes) >= number_required:
-                break
-            else:
-                continue
-
-        # decode for one step using decoder
-        decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs)
-
-        # PUT HERE REAL BEAM SEARCH OF TOP
-        log_prob, indexes = torch.topk(decoder_output, beam_width)
-        nextnodes = []
-
-        for new_k in range(beam_width):
-            decoded_t = indexes[0][new_k].view(1, -1)
-            log_p = log_prob[0][new_k].item()
-
-            node = BeamSearchNode(decoder_hidden, n, decoded_t, n.logp + log_p, n.leng + 1)
-            score = -node.eval()
-            nextnodes.append((score, node))
-
-        # put them into queue
-        for i in range(len(nextnodes)):
-            score, nn = nextnodes[i]
-            nodes.put((score, nn))
-        # increase qsize
-        qsize += len(nextnodes) - 1
-        
-        # choose nbest paths, back trace them
-        if len(endnodes) == 0:
-            endnodes = [nodes.get() for _ in range(topk)]
-
-        utterances = []
-        for score, n in sorted(endnodes, key=operator.itemgetter(0)):
-            utterance = []
-            utterance.append(n.wordid)
-            # back trace
-            while n.prevNode != None:
-                n = n.prevNode
-                utterance.append(n.wordid)
-
-            utterance = utterance[::-1]
-            utterances.append(utterance)
-
-        decoded_batch.append(utterances)
-        
-    return decoded_batch
-def greedy_decode(decoder, decoder_hidden, encoder_outputs, target_tensor):
-    '''
-    :param target_tensor: target indexes tensor of shape [B, T] where B is the batch size and T is the maximum length of the output sentence
-    :param decoder_hidden: input tensor of shape [1, B, H] for start of the decoding
-    :param encoder_outputs: if you are using attention mechanism you can pass encoder outputs, [T, B, H] where T is the maximum length of input sentence
-    :return: decoded_batch
-    '''
-
-    batch_size, seq_len = target_tensor.size()
-    decoded_batch = torch.zeros((batch_size, MAX_LENGTH))
-    decoder_input = torch.LongTensor([[SOS_token] for _ in range(batch_size)], device=device)
-
-    for t in range(MAX_LENGTH):
-        decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs)
-
-        topv, topi = decoder_output.data.topk(1)  # get candidates
-        topi = topi.view(-1)
-        decoded_batch[:, t] = topi
-
-        decoder_input = topi.detach().view(-1, 1)
-
-    return decoded_batch
     
 class AttnDecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
@@ -880,6 +711,7 @@ def timeSince(since, percent):
     rs = es - s
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
+import tkinter
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
 import matplotlib.ticker as ticker
@@ -968,12 +800,12 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
         # Assign encoder result to the 1st decoder hidden unit
         decoder_hidden = encoder_hidden
 
-        # Initiate decoder output (greedy_search)
+        # Initiate decoder output
         decoded_words = []
-        # Initiate decoder attention (greedy_search)
+        # Initiate decoder attention
         decoder_attentions = torch.zeros(max_length, max_length)
-        
-        # for each decoder input (greedy_search)
+
+        # for each decoder input
         for di in range(max_length):
             # Execute decoder process
             decoder_output, decoder_hidden, decoder_attention = decoder(
@@ -988,46 +820,26 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
                 decoded_words.append(output_lang.index2word[topi.item()])
 
             decoder_input = topi.squeeze().detach()
-        
-        # Initiate decoder output (beam_search)
-        beam_width = 3
-        bs_decoded_words = []
-        # Initiate decoder attention (beam_search)
-        bs_decoder_attentions = torch.zeros(max_length, max_length)
-        utterances = beam_search(
-            beam_width, decoder, encoder_hidden, encoder_outputs, MAX_LENGTH)
-        bs_value = utterances[-1]
-        
-        for di in range(max_length):
-            (da, word_index) = bs_value[di + 1]
-            bs_decoder_attentions[di] = da
-            if word_index.item() == EOS_token:
-                bs_decoded_words.append('<EOS>')
-                break
-            else:
-                bs_decoded_words.append(output_lang.index2word[word_index.item()])
-        
-        
-        return decoded_words, decoder_attentions[:di + 1], bs_decoded_words, bs_decoder_attentions[:di + 1]
+
+        return decoded_words, decoder_attentions[:di + 1]
 
 def evaluateRandomly(encoder, decoder, n=10):
     for i in range(n):
-        print("-----------------------------------------------------------")
+    #for pair in pairs:
         pair = random.choice(pairs)
-        print('Input:', pair[0])
-        print('Goal:', pair[1])
-        output_words, attentions, bs_output, bs_attentions = evaluate(encoder, decoder, pair[0])
+        print('>', pair[0])
+        print('=', pair[1])
+        output_words, attentions = evaluate(encoder, decoder, pair[0])
         output_sentence = ' '.join(output_words)
-        bs_sentence = ' '.join(bs_output)
-        print('Greedy search:', output_sentence)
-        print('Beam search:', bs_sentence)
+        print('<', output_sentence)
+        print('')
         
 hidden_size = 2048
-#hidden_size = 256
+#hidden_size = 512
 encoder1 = EncoderRNN(input_lang.n_words, hidden_size).to(device)
 attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words, dropout_p=0.1).to(device)
 
-trainIters(encoder1, attn_decoder1, 200000, print_every=5000)
+trainIters(encoder1, attn_decoder1, 130000, print_every=5000)
 #trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
 
 evaluateRandomly(encoder1, attn_decoder1)
@@ -1052,16 +864,11 @@ def showAttention(input_sentence, output_words, attentions):
 
 
 def evaluateAndShowAttention(input_sentence):
-    output_words, attentions, bs_output, bs_attentions = evaluate(
+    output_words, attentions = evaluate(
         encoder1, attn_decoder1, input_sentence)
     print('input =', input_sentence)
-    print('greedy search =', ' '.join(output_words))
-    print('beam search =', ' '.join(bs_output))
-    print('Greedy_search attention:')
+    print('output =', ' '.join(output_words))
     showAttention(input_sentence, output_words, attentions)
-    print('Beam_search attention:')
-    showAttention(input_sentence, bs_output, bs_attentions)
-    
 
 evaluateAndShowAttention(normalizeString("i know all the possibility .".lower().strip()))
 
