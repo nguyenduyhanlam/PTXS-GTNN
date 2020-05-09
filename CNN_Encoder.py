@@ -270,168 +270,100 @@ print(random.choice(pairs))
 print(lemmatizer("I'm excited about watching that movie"))
 print(lemmatizer("The pizza was delivered to the wrong address"))
 
-class GRC(nn.Module):
-    def __init__(self, char_enc_size, label_to_ind, rnn_type, emb_size, hidden_size, num_layers,
-                  bidirectional,max_path, recurrent_drop=0, input_drop=0):
-        super(GRC, self).__init__()
-        self.char_embed = nn.Linear(char_enc_size, emb_size)
-        self.rnn_type = rnn_type
-        self.hidden_size = hidden_size 
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.hidden_size_seg = self.hidden_size
-        self.recurrent_drop = recurrent_drop
+class GrConv(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(GrConv, self).__init__()
+        self.hidden_size = hidden_size
         
-        if self.bidirectional == True:
-            self.NUM_DIRECTIONS = 2
-        else:
-            self.NUM_DIRECTIONS = 1
-        if rnn_type in ['LSTM', 'GRU']:
-            self.rnn = getattr(nn, rnn_type)(emb_size, self.hidden_size // self.NUM_DIRECTIONS, num_layers, batch_first=False,
-                              dropout=self.recurrent_drop, bidirectional = self.bidirectional)
-         
+        # A simple lookup table that stores embeddings of a fixed dictionary 
+        # and size. 
+        # This module is often used to store word embeddings and retrieve them using indices. 
+        # The input to the module is a list of indices, 
+        # and the output is the corresponding word embeddings.
+        # input_size: num_embeddings (python:int) – size of the dictionary of embeddings
+        # hidden_size: embedding_dim (python:int) – the size of each embedding vector
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        
+        # Applies a multi-layer gated recurrent unit (GRU) RNN to an input sequence.
+        # hidden_size: input_size – The number of expected features in the input x
+        # hidden_size: hidden_size – The number of features in the hidden state h
+        self.gru = nn.GRU(hidden_size, hidden_size)
+        
+        # Applies a linear transformation to the incoming data: y = xA^T + b
+        # hidden_size: in_features – size of each input sample
+        # hidden_size: out_features – size of each output sample
+        # Represent: WL in (WL * h_(t-1, j-1))
         self.WL = nn.Linear(self.hidden_size, self.hidden_size, bias=None)
-        self.WR = nn.Linear(self.hidden_size, self.hidden_size, bias=None)
+        # Applies a linear transformation to the incoming data: y = xA^T + b
+        # hidden_size: in_features – size of each input sample
+        # hidden_size: out_features – size of each output sample
+        # Represent: WR in (WR * h_(t-1, j))
+        self.WR = nn.Linear(self.hidden_size, self.hidden_size, bias=None) 
         
-        self.bw = nn.Parameter(torch.FloatTensor(1, self.hidden_size).zero_())        
-        
+        # Applies a linear transformation to the incoming data: y = xA^T + b
+        # hidden_size: in_features – size of each input sample
+        # hidden_size: out_features – size of each output sample
+        # Represent: GL in (GL * h_(t-1, j-1))
         self.GL = nn.Linear(self.hidden_size, 3*self.hidden_size, bias=None)
+        # Applies a linear transformation to the incoming data: y = xA^T + b
+        # hidden_size: in_features – size of each input sample
+        # hidden_size: out_features – size of each output sample
+        # Represent: GR in (GR * h_(t-1, j-1))
         self.GR = nn.Linear(self.hidden_size, 3*self.hidden_size, bias=None)
         
-        self.bg = nn.Parameter(torch.FloatTensor(1, 3*self.hidden_size).zero_())     
-        self.sigm = torch.nn.Sigmoid()    
+        self.sigm = torch.nn.Sigmoid()
+
+    def forward(self, input):
+        # Create the array to store all the next hidden units
+        next_hiddens = []
         
-        self.tag_to_ix = label_to_ind
-        self.tagset_size = len(self.tag_to_ix)
-        self.max_path = max_path
-        
-        self.drop3d = nn.Dropout3d(input_drop)
-        self.drop = nn.Dropout(input_drop)
-        
-        self.fc = nn.Linear(self.hidden_size_seg,  self.tagset_size)
-        self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
+        # Forwarding process
+        for ei in range(len(input) - 1):
+            left_node = input[ei]
+            right_node = input[ei + 1]
+            
+            # Calculate h~
+            center_node = self.sigm(self.WL(left_node) + self.WR(right_node))
+            
+            # Calculate (GL*left_node + GR*right_node)
+            gate_feature = self.GL(left_node) + self.GR(right_node)
+            
+            # Calculate exp(GL*left_node + GR*right_node)
+            gate_feature = torch.exp(gate_feature)
+            
+            # Get gate batches [0:hidden_unit],[hidden_unit:2*hidden_unit],[2*hidden_unit:3*hidden_unit]
+            omega_scores = tuple(gate_feature[:, :, i*self.hidden_size : (i+1)*self.hidden_size].unsqueeze(-1) for i in range(3))
+            omega_scores = torch.cat(omega_scores, 3)
+            
+            # Calculate Z = sum(exp(GL*left_node + GR*right_node))_k for k in [1,3]
+            Z = torch.sum(omega_scores, 3)
+            
+            # Calculate (1/Z)*(exp(GL*left_node + GR*right_node))
+            divide_Z = 1/Z.unsqueeze(-1).expand(*Z.size(), 3)
+            omega_norm = divide_Z * omega_scores
+            
+            # Calculate the next hidden_unit=omega_left*left_node + omega_right*right_node + omega_center*center_node
+            next_node = torch.mul(left_node,omega_norm[:,:,:,0]) + torch.mul(right_node,omega_norm[:,:,:,1]) + torch.mul(center_node,omega_norm[:,:,:,2])
+            
+            # Save the result to array
+            next_hiddens.append(next_node)
+            
+        return next_hiddens
+
+    def initHidden(self, input):
+        # Save input tensor size
+        input_length = input.size(0)
     
-        self.init_weights()
-
-
-    def init_hidden(self, batch_size):
-        weight = next(self.parameters()).data
-        if self.rnn_type == 'LSTM':
-            return (Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_()),
-                        Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_()))
-        else:
-            return Variable(weight.new(self.num_layers*self.NUM_DIRECTIONS, batch_size, self.hidden_size // self.NUM_DIRECTIONS).zero_() )    
-    
-    
-    def init_hidden_seg(self, batch_size):
-        weight = next(self.parameters()).data
-        if self.rnn_type == 'LSTM':
-            return (Variable(weight.new(1, batch_size, self.hidden_size_seg //2  ).zero_()),
-                        Variable(weight.new(1, batch_size, self.hidden_size_seg //2).zero_()))
-        else:
-            return Variable(weight.new(1, batch_size, self.hidden_size_seg).zero_() ) 
-
-
-    def forward(self, x_batch_s, hidden, sorted_vals):
-        batch_size = x_batch_s.size(1)
-        x_batch_s = self.drop3d(x_batch_s)
-        emb = self.char_embed(x_batch_s)
-        emb = self.drop(emb)
+        # Embedding storage
+        embedding_storage = []
         
-        pack_emb = torch.nn.utils.rnn.pack_padded_sequence(emb, sorted_vals)
-        out, hidden = self.rnn(pack_emb, hidden)
-        unpacked, unpacked_len = torch.nn.utils.rnn.pad_packed_sequence(out)
-        
-        max_len = unpacked.size(0)
-        unpacked = unpacked.transpose(1,0)
-
-        segment_feat = Variable(unpacked.data.new(batch_size, max_len, self.max_path, self.hidden_size).fill_(0))
-        segment_feat[:, :, 0, :] = unpacked[:,:,:]
-        
-        left_feat = unpacked[:,:-1,:].contiguous().view(-1, self.hidden_size )
-        right_feat = unpacked[:,1:,:].contiguous().view(-1, self.hidden_size )
-        
-        for i in range(1, self.max_path):
-            next_level_cand = self.WL(left_feat) + self.WR(right_feat) + self.bw
-            next_level_cand = 4*(self.sigm(next_level_cand) - 0.5)
+        # Embedding all the inputs and save it to storage
+        for ei in range(input_length):
+            embedded = self.embedding(input[ei]).view(1, 1, -1)
+            embedding_storage.append(embedded)
             
-            gate_feat = self.GL(left_feat) + self.GR(right_feat) + self.bg
-            gate_feat = torch.exp(gate_feat)
-            
-            theta_scores =  tuple( gate_feat[:, i*self.hidden_size:(i+1)*self.hidden_size].unsqueeze(-1) for i in range(3) )
-            theta_scores = torch.cat( theta_scores, 2)
-            
-            Z = torch.sum(theta_scores, 2)
-            inv_z = 1/Z.unsqueeze(-1).expand(*Z.size(), 3)
-            theta_norm = theta_scores * inv_z
-            
-            next_level_cand =   torch.mul(left_feat,theta_norm[:,:,0]) + torch.mul(right_feat,theta_norm[:,:,1]) + torch.mul(next_level_cand,theta_norm[:,:,2])
-            next_level_cand = next_level_cand.view(batch_size, max_len-i, self.hidden_size)
-            
-            segment_feat[:, i:, i, :] = next_level_cand
-            left_feat = next_level_cand[:,:-1,:].contiguous().view(-1, self.hidden_size )
-            right_feat = next_level_cand[:,1:,:].contiguous().view(-1, self.hidden_size )
+        return embedding_storage
 
-        #Get tag scores for crf
-        segment_feat = self.fc(self.drop(segment_feat.view(-1, self.hidden_size) ))
-        segment_feat = segment_feat.view(batch_size, max_len, self.max_path, self.tagset_size)
-        
-        return segment_feat, hidden    
-  
-    
-    def init_weights(self):
-        self.fc.bias.data.fill_(0)
-        for name, param in self.named_parameters(): 
-            if ('weight' in name): 
-                print ('Initializing ', name) 
-                initrange = np.sqrt( 6 / sum(param.size()))
-                self.state_dict()[name].uniform_(-initrange, initrange)
-             
-        
-    def _forward_alg(self, logits, len_list, is_volatile=False):
-        """
-        Computes the (batch_size,) denominator term (FloatTensor list) for the log-likelihood, which is the
-        sum of the likelihoods across all possible state sequences.
-        
-        Arguments:
-            logits: [batch_size, seq_len, max_path, n_labels] FloatTensor
-            lens: [batch_size] LongTensor
-        """
-        batch_size, seq_len, max_path, n_labels = logits.size()
-        
-        alpha = logits.data.new(batch_size, seq_len+1, self.tagset_size).fill_(-10000)
-        alpha[:, 0, self.tag_to_ix['START']] = 0
-        alpha = Variable(alpha, volatile=is_volatile)
-        
-        # Transpose batch size and time dimensions:
-        logits_t = logits.permute(1,0,2,3)
-        c_lens = len_list.clone()
-        
-        alpha_out_sum = Variable(logits.data.new(batch_size,max_path, self.tagset_size).fill_(0))
-        mat = Variable(logits.data.new(batch_size,self.tagset_size,self.tagset_size).fill_(0))
-        
-        for j, logit in enumerate(logits_t):
-            for i in range(0,max_path):
-                if i<=j:
-                    alpha_exp = alpha[:,j-i, :].clone().unsqueeze(1).expand(batch_size,self.tagset_size, self.tagset_size)
-                    logit_exp = logit[:, i].unsqueeze(-1).expand(batch_size, self.tagset_size, self.tagset_size)
-                    trans_exp = self.transitions.unsqueeze(0).expand_as(alpha_exp)
-                    mat = alpha_exp + logit_exp + trans_exp
-                    alpha_out_sum[:,i,:] =  log_sum_exp(mat , 2, keepdim=True)
-                    
-            alpha_nxt = log_sum_exp(alpha_out_sum , dim=1, keepdim=True).squeeze(1)
-            
-            mask = Variable((c_lens > 0).float().unsqueeze(-1).expand(batch_size,self.tagset_size))
-            alpha_nxt = mask * alpha_nxt + (1 - mask) *alpha[:, j, :].clone() 
-            
-            c_lens = c_lens - 1      
-
-            alpha[:,j+1, :] = alpha_nxt
-
-        alpha[:,-1,:] = alpha[:,-1,:] + self.transitions[self.tag_to_ix['STOP']].unsqueeze(0).expand_as(alpha[:,-1,:])
-        norm = log_sum_exp(alpha[:,-1,:], 1).squeeze(-1)
-
-        return norm
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(EncoderRNN, self).__init__()
@@ -628,7 +560,7 @@ teacher_forcing_ratio = 0.5
 def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length=MAX_LENGTH):
     
     # Intiatie encoder process
-    encoder_hidden = encoder.initHidden()
+    encoder_hiddens = encoder.initHidden(input_tensor)
 
     # Clears the gradients of all optimized torch.Tensor.
     encoder_optimizer.zero_grad()
@@ -640,25 +572,19 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
     # Save output tensor size
     target_length = target_tensor.size(0)
 
-    # Initiate encoder output
-    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-
     # Initiate loss value
     loss = 0
 
     # for each encoder input
-    for ei in range(input_length):
+    for t in range(input_length - 1):
         # Execute encoder process
-        encoder_output, encoder_hidden = encoder(
-            input_tensor[ei], encoder_hidden)
-        # Save encoder result
-        encoder_outputs[ei] = encoder_output[0, 0]
+        encoder_hiddens = encoder(encoder_hiddens)
 
     # Initiate decoder input
     decoder_input = torch.tensor([[SOS_token]], device=device)
 
     # Assign encoder result to the 1st decoder hidden unit
-    decoder_hidden = encoder_hidden
+    decoder_hidden = encoder_hiddens[0]
 
     # Randomly using teacher_forcing feature
     use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
@@ -667,8 +593,8 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
         # Teacher forcing: Feed the target as the next input
         for di in range(target_length):
             # Execute decoder process
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden)
             # Add loss
             loss += criterion(decoder_output, target_tensor[di])
             decoder_input = target_tensor[di]  # Teacher forcing
@@ -677,8 +603,8 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
         # Without teacher forcing: use its own predictions as the next input
         for di in range(target_length):
             # Execute decoder process
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden)
             topv, topi = decoder_output.topk(1)
             decoder_input = topi.squeeze().detach()  # detach from history as input
 
@@ -780,38 +706,28 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
         input_tensor = tensorFromSentence(input_lang, lemmatizer(sentence))
         input_length = input_tensor.size()[0]
 
-        # Initiate encoder process
-        encoder_hidden = encoder.initHidden()
-
-        # Initiate encoder output
-        encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
+        # Intiatie encoder process
+        encoder_hiddens = encoder.initHidden(input_tensor)
 
         # for each encoder input
-        for ei in range(input_length):
+        for t in range(input_length - 1):
             # Execute encoder process
-            encoder_output, encoder_hidden = encoder(input_tensor[ei],
-                                                     encoder_hidden)
-            # Save encoder result
-            encoder_outputs[ei] += encoder_output[0, 0]
+            encoder_hiddens = encoder(encoder_hiddens)
 
         # Initiate decoder input
         decoder_input = torch.tensor([[SOS_token]], device=device)  # SOS
 
         # Assign encoder result to the 1st decoder hidden unit
-        decoder_hidden = encoder_hidden
+        decoder_hidden = encoder_hiddens[0]
 
         # Initiate decoder output
         decoded_words = []
-        # Initiate decoder attention
-        decoder_attentions = torch.zeros(max_length, max_length)
 
         # for each decoder input
         for di in range(max_length):
             # Execute decoder process
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
-            # Save decoder attention
-            decoder_attentions[di] = decoder_attention.data
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden)
             topv, topi = decoder_output.data.topk(1)
             if topi.item() == EOS_token:
                 decoded_words.append('<EOS>')
@@ -821,7 +737,7 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
 
             decoder_input = topi.squeeze().detach()
 
-        return decoded_words, decoder_attentions[:di + 1]
+        return decoded_words
 
 def evaluateRandomly(encoder, decoder, n=10):
     for i in range(n):
@@ -829,46 +745,26 @@ def evaluateRandomly(encoder, decoder, n=10):
         pair = random.choice(pairs)
         print('>', pair[0])
         print('=', pair[1])
-        output_words, attentions = evaluate(encoder, decoder, pair[0])
+        output_words = evaluate(encoder, decoder, pair[0])
         output_sentence = ' '.join(output_words)
         print('<', output_sentence)
         print('')
         
 hidden_size = 2048
 #hidden_size = 512
-encoder1 = EncoderRNN(input_lang.n_words, hidden_size).to(device)
-attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words, dropout_p=0.1).to(device)
+encoder1 = GrConv(input_lang.n_words, hidden_size).to(device)
+decoder1 = DecoderRNN(hidden_size, output_lang.n_words).to(device)
 
-trainIters(encoder1, attn_decoder1, 130000, print_every=5000)
+trainIters(encoder1, decoder1, 130000, print_every=5000)
 #trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
 
-evaluateRandomly(encoder1, attn_decoder1)
-
-def showAttention(input_sentence, output_words, attentions):
-    # Set up figure with colorbar
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    cax = ax.matshow(attentions.numpy(), cmap='bone')
-    fig.colorbar(cax)
-
-    # Set up axes
-    ax.set_xticklabels([''] + input_sentence.split(' ') +
-                       ['<EOS>'], rotation=90)
-    ax.set_yticklabels([''] + output_words)
-
-    # Show label at every tick
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
-
-    plt.show()
-
+evaluateRandomly(encoder1, decoder1)
 
 def evaluateAndShowAttention(input_sentence):
-    output_words, attentions = evaluate(
-        encoder1, attn_decoder1, input_sentence)
+    output_words = evaluate(
+        encoder1, decoder1, input_sentence)
     print('input =', input_sentence)
     print('output =', ' '.join(output_words))
-    showAttention(input_sentence, output_words, attentions)
 
 evaluateAndShowAttention(normalizeString("i know all the possibility .".lower().strip()))
 

@@ -355,7 +355,7 @@ class DecoderRNN(nn.Module):
         return torch.zeros(1, 1, self.hidden_size, device=device)
 
 class BeamSearchNode(object):
-    def __init__(self, hiddenstate, previousNode, resultId, wordId, logProb, loss_value, length, decoder_attentions):
+    def __init__(self, hiddenstate, previousNode, resultId, wordId, logProb, loss_value, length, decoder_attentions, decoder_output):
         '''
         :param hiddenstate:
         :param previousNode:
@@ -371,6 +371,7 @@ class BeamSearchNode(object):
         self.id = resultId
         self.loss = loss_value
         self.da = decoder_attentions
+        self.do = decoder_output
 
     def eval(self, alpha=1.0):
         reward = 0
@@ -401,8 +402,8 @@ def beam_search(beam_width, decoder, encoder_hidden, encoder_outputs=None, max_l
     # Initiate searching process
     queue = PriorityQueue()
     
-    # starting node -  hidden vector, previous node, result id, word id, logp, loss_value, length, decoder_attentions
-    node = BeamSearchNode(decoder_hidden, None, SOS_token, decoder_input, 0, 0, 1, None)
+    # starting node -  hidden vector, previous node, result id, word id, logp, loss_value, length, decoder_attentions, decoder_output
+    node = BeamSearchNode(decoder_hidden, None, SOS_token, decoder_input, 0, 0, 1, None, None)
     
     # Put to the queue and increase its size
     queue.put((-node.eval(), node))
@@ -439,7 +440,7 @@ def beam_search(beam_width, decoder, encoder_hidden, encoder_outputs=None, max_l
                     node_length = n.leng + 1
                     
                     # queue node -  hidden vector, previous node, result id, word id, logp, loss_value, length, decoder_attentions
-                    node = BeamSearchNode(decoder_hidden, n, topi[0][i], decoder_input, prob, 0, node_length, decoder_attention.data)
+                    node = BeamSearchNode(decoder_hidden, n, topi[0][i], decoder_input, prob, 0, node_length, decoder_attention.data, decoder_output)
                     
                     # Calculate the score for each node
                     score = -node.eval()
@@ -464,11 +465,11 @@ def beam_search(beam_width, decoder, encoder_hidden, encoder_outputs=None, max_l
         qsize -= 1
             
         utterance = []
-        utterance.append((n.da, n.wordid))
+        utterance.append((n.da, n.wordid, n.do))
         # back trace
         while n.prevNode != None:
             n = n.prevNode
-            utterance.append((n.da, n.wordid))
+            utterance.append((n.da, n.wordid, n.do))
 
         utterance = utterance[::-1]
         utterances.append(utterance)
@@ -828,34 +829,24 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
 
     # Assign encoder result to the 1st decoder hidden unit
     decoder_hidden = encoder_hidden
-
-    # Randomly using teacher_forcing feature
-    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
-
-    if use_teacher_forcing:
-        # Teacher forcing: Feed the target as the next input
-        for di in range(target_length):
-            # Execute decoder process
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
-            # Add loss
-            loss += criterion(decoder_output, target_tensor[di])
-            decoder_input = target_tensor[di]  # Teacher forcing
-
-    else:
-        # Without teacher forcing: use its own predictions as the next input
-        for di in range(target_length):
-            # Execute decoder process
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
-            topv, topi = decoder_output.topk(1)
-            decoder_input = topi.squeeze().detach()  # detach from history as input
-
-            # Add loss
-            loss += criterion(decoder_output, target_tensor[di])
-            if decoder_input.item() == EOS_token:
-                break
-
+    
+    # Initiate decoder output (beam_search)
+    beam_width = 3
+    bs_decoded_words = []
+    # Initiate decoder attention (beam_search)
+    bs_decoder_attentions = torch.zeros(max_length, max_length)
+    utterances = beam_search(
+        beam_width, decoder, encoder_hidden, encoder_outputs, target_length)
+    bs_value = utterances[-1]
+        
+    for di in range(target_length):
+        (da, word_index, do) = bs_value[di + 1]
+        bs_decoder_attentions[di] = da
+        # Add loss
+        loss += criterion(do, target_tensor[di])
+        if decoder_input.item() == EOS_token:
+            break
+    
     # Backpropagation
     loss.backward()
 
@@ -1007,7 +998,6 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
             else:
                 bs_decoded_words.append(output_lang.index2word[word_index.item()])
         
-        
         return decoded_words, decoder_attentions[:di + 1], bs_decoded_words, bs_decoder_attentions[:di + 1]
 
 def evaluateRandomly(encoder, decoder, n=10):
@@ -1027,7 +1017,7 @@ hidden_size = 2048
 encoder1 = EncoderRNN(input_lang.n_words, hidden_size).to(device)
 attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words, dropout_p=0.1).to(device)
 
-trainIters(encoder1, attn_decoder1, 200000, print_every=5000)
+trainIters(encoder1, attn_decoder1, 130000, print_every=5000)
 #trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
 
 evaluateRandomly(encoder1, attn_decoder1)
